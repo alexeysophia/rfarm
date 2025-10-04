@@ -19,6 +19,7 @@ RUN apt-get update \
         python3 \
         python3-pip \
         python3-venv \
+        bash \
     && rm -rf /var/lib/apt/lists/*
 
 ARG BLENDER_MAJOR_VERSION=4.5
