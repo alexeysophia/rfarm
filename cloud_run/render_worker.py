@@ -16,7 +16,30 @@ def _configure_cycles(device: str, compute_device: str) -> None:
     prefs = cycles_addon.preferences
     prefs.get_devices()
     compute_device = compute_device.upper()
-    prefs.compute_device_type = compute_device
+    available_types = {device_item.type for device_item in prefs.devices}
+    if compute_device not in available_types:
+        fallback = "CUDA" if "CUDA" in available_types else None
+        if device.upper() == "GPU" and fallback:
+            if fallback != compute_device:
+                print(
+                    json.dumps(
+                        {
+                            "event": "cycles_compute_device_fallback",
+                            "requested": compute_device,
+                            "fallback": fallback,
+                        }
+                    )
+                )
+            compute_device = fallback
+        elif device.upper() == "GPU":
+            raise RuntimeError(
+                f"Requested compute device {compute_device!r} not available; available: {sorted(available_types)}"
+            )
+        else:
+            compute_device = None
+
+    if compute_device:
+        prefs.compute_device_type = compute_device
     for device_item in prefs.devices:
         if device_item.type == compute_device:
             device_item.use = True
@@ -59,7 +82,7 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-basename", required=True)
     parser.add_argument("--device", default="GPU")
-    parser.add_argument("--compute-device", default="CUDA")
+    parser.add_argument("--compute-device", default="OPTIX")
     parser.add_argument("--samples", type=int, default=None)
     parser.add_argument("--resolution-x", type=int, default=None)
     parser.add_argument("--resolution-y", type=int, default=None)

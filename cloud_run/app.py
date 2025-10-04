@@ -41,7 +41,7 @@ class RenderRequest(BaseModel):
     blend_file: str = Field(description="Base64 encoded .blend content")
     render_settings: RenderSettings = Field(default_factory=RenderSettings)
     device: str = Field(default="GPU", description="Either GPU or CPU")
-    compute_device_type: str = Field(default="CUDA", description="Cycles compute device")
+    compute_device_type: str = Field(default="OPTIX", description="Cycles compute device")
 
 
 class RenderResponse(BaseModel):

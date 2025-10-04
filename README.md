@@ -43,7 +43,7 @@ gcloud run deploy rfarm-render \
   --image gcr.io/PROJECT_ID/rfarm-render \
   --platform managed \
   --region REGION \
-  --gpu gpu-tesla-t4 \
+  --gpu accelerator-type=nvidia-l4 \
   --gpu-count 1 \
   --memory 16Gi \
   --cpu 4 \
@@ -53,7 +53,7 @@ gcloud run deploy rfarm-render \
   --allow-unauthenticated
 ```
 
-Adjust the region and GPU type depending on availability. The worker only runs while a render job is executing, allowing you to pay only for active render time. Consider restricting access (e.g. with a service account and Cloud Endpoints) for production deployments.
+Cloud Run currently provisions NVIDIA L4 GPUs for managed GPU services. Adjust the region depending on availability. The worker only runs while a render job is executing, allowing you to pay only for active render time. Consider restricting access (e.g. with a service account and Cloud Endpoints) for production deployments. The worker prefers the Cycles **OPTIX** compute backend (best suited for L4) and automatically falls back to CUDA when OPTIX is unavailable.
 
 ### API contract
 
@@ -73,7 +73,7 @@ Adjust the region and GPU type depending on availability. The worker only runs w
     "color_depth": "8"
   },
   "device": "GPU",
-  "compute_device_type": "CUDA"
+  "compute_device_type": "OPTIX"
 }
 ```
 
@@ -91,7 +91,7 @@ pip install -r requirements.txt
 uvicorn app:app --reload --host 0.0.0.0 --port 8080
 ```
 
-Then point the Blender add-on endpoint to `http://127.0.0.1:8080` (requires Blender to have access to the same Docker daemon or Blender installation to execute renders locally).
+Then point the Blender add-on endpoint to `http://127.0.0.1:8080` (requires Blender to have access to the same Docker daemon or Blender installation to execute renders locally). When deployed to Cloud Run the worker logs include the detected GPU via `nvidia-smi`, which should report `NVIDIA L4`.
 
 ## Security and scaling considerations
 
