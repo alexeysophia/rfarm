@@ -20,10 +20,12 @@ RUN apt-get update \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-ARG BLENDER_VERSION=4.5.0
+ARG BLENDER_MAJOR_VERSION=4.5
+ARG BLENDER_MINOR_VERSION=0
+ARG BLENDER_VERSION=${BLENDER_MAJOR_VERSION}.${BLENDER_MINOR_VERSION}
 ARG BLENDER_DIST=blender-${BLENDER_VERSION}-linux-x64
 
-RUN wget -q https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/${BLENDER_DIST}.tar.xz -O /tmp/blender.tar.xz \
+RUN wget -q https://download.blender.org/release/Blender${BLENDER_MAJOR_VERSION}/${BLENDER_DIST}.tar.xz -O /tmp/blender.tar.xz \
     && tar -xJf /tmp/blender.tar.xz -C /opt \
     && ln -s /opt/${BLENDER_DIST}/blender /usr/local/bin/blender \
     && rm /tmp/blender.tar.xz
@@ -37,7 +39,7 @@ COPY app.py render_worker.py start.sh ./
 RUN chmod +x start.sh
 
 ENV BLENDER_USER_CONFIG=/tmp/blender
-ENV BLENDER_SYSTEM_SCRIPTS=/opt/${BLENDER_DIST}/${BLENDER_VERSION%.*}/scripts
-ENV BLENDER_SYSTEM_DATAFILES=/opt/${BLENDER_DIST}/${BLENDER_VERSION%.*}/datafiles
+ENV BLENDER_SYSTEM_SCRIPTS=/opt/${BLENDER_DIST}/${BLENDER_VERSION}/scripts
+ENV BLENDER_SYSTEM_DATAFILES=/opt/${BLENDER_DIST}/${BLENDER_VERSION}/datafiles
 
 CMD ["./start.sh"]
