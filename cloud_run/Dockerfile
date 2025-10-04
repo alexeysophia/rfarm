@@ -38,6 +38,7 @@ COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY app.py render_worker.py start.sh ./
+RUN sed -i 's/\r$//' start.sh
 RUN chmod +x start.sh
 
 ENV BLENDER_USER_CONFIG=/tmp/blender
