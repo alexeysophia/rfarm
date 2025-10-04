@@ -20,7 +20,7 @@ RUN apt-get update \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-ARG BLENDER_VERSION=3.6.5
+ARG BLENDER_VERSION=4.5.0
 ARG BLENDER_DIST=blender-${BLENDER_VERSION}-linux-x64
 
 RUN wget -q https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/${BLENDER_DIST}.tar.xz -O /tmp/blender.tar.xz \

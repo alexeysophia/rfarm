@@ -34,7 +34,7 @@ The worker is a FastAPI application that receives a `.blend` file (base64-encode
 gcloud builds submit --tag gcr.io/PROJECT_ID/rfarm-render cloud_run
 ```
 
-The Docker image installs Blender 3.6.5 on top of an NVIDIA CUDA 12 runtime image and uses `uvicorn` to expose the FastAPI service.
+The Docker image installs Blender 4.5.0 on top of an NVIDIA CUDA 12 runtime image and uses `uvicorn` to expose the FastAPI service.
 
 ### Deploying to Cloud Run (GPU)
 
