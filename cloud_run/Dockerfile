@@ -8,6 +8,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
+        xz-utils \
         libx11-6 \
         libxi6 \
         libxxf86vm1 \
