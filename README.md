@@ -43,8 +43,8 @@ gcloud run deploy rfarm-render \
   --image gcr.io/PROJECT_ID/rfarm-render \
   --platform managed \
   --region REGION \
-  --gpu accelerator-type=nvidia-l4 \
-  --gpu-count 1 \
+  --gpu=1 \
+  --no-gpu-zonal-redundancy \
   --memory 16Gi \
   --cpu 4 \
   --timeout 15m \
