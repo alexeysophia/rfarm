@@ -65,7 +65,6 @@ class RenderResponse(BaseModel):
     logs: Optional[str] = None
 
 
-@app.get("/healthz")
 class BlendUploadRequest(BaseModel):
     filename: str = Field(
         default="scene.blend",
@@ -80,6 +79,7 @@ class BlendUploadResponse(BaseModel):
     expires_in: int = Field(description="Validity of the signed URL in seconds")
 
 
+@app.get("/healthz")
 def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
 
