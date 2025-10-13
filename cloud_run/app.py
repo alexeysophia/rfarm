@@ -267,7 +267,7 @@ def _run_blender(blend_path: Path, request: RenderRequest) -> Dict[str, Any]:
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Blender failed: {logs[-2000:]}")
 
-    output_path = None
+    output_path: Optional[Path] = None
     for line in logs.splitlines():
         try:
             payload = json.loads(line)
@@ -276,6 +276,17 @@ def _run_blender(blend_path: Path, request: RenderRequest) -> Dict[str, Any]:
         if "output_path" in payload:
             output_path = Path(payload["output_path"])
             break
+
+    if (not output_path or not output_path.exists()) and output_dir.exists():
+        # Blender should always emit a JSON payload with the rendered file path, but in
+        # some environments the log output can be truncated or the path may reference a
+        # file without the expected extension. To avoid falsely reporting a failure when
+        # the render actually succeeded, fall back to inspecting the output directory.
+        candidates = sorted(output_dir.glob(f"{output_basename}*"))
+        if not candidates:
+            candidates = sorted(output_dir.glob("*"))
+        if candidates:
+            output_path = candidates[-1]
 
     if not output_path or not output_path.exists():
         raise HTTPException(status_code=500, detail="Render worker did not produce output")
