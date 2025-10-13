@@ -109,7 +109,7 @@ def _get_service_account_email() -> Optional[str]:
     env_email = os.environ.get("RFARM_SERVICE_ACCOUNT_EMAIL") or os.environ.get(
         "GOOGLE_SERVICE_ACCOUNT_EMAIL"
     )
-    if env_email:
+    if env_email and "@" in env_email:
         _service_account_email = env_email
         return _service_account_email
 
@@ -120,7 +120,7 @@ def _get_service_account_email() -> Optional[str]:
 
     if credentials:
         email = getattr(credentials, "service_account_email", None)
-        if email:
+        if email and "@" in email:
             _service_account_email = email
             return _service_account_email
 
@@ -131,6 +131,8 @@ def _get_service_account_email() -> Optional[str]:
         )
         with urlopen(metadata_request, timeout=2) as response:
             email = response.read().decode("utf-8").strip()
+            if email and "@" not in email:
+                email = None
     except (URLError, OSError, TimeoutError):
         email = None
 
