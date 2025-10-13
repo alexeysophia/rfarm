@@ -65,7 +65,6 @@ class RenderResponse(BaseModel):
     logs: Optional[str] = None
 
 
-@app.get("/healthz")
 class BlendUploadRequest(BaseModel):
     filename: str = Field(
         default="scene.blend",
@@ -80,6 +79,7 @@ class BlendUploadResponse(BaseModel):
     expires_in: int = Field(description="Validity of the signed URL in seconds")
 
 
+@app.get("/healthz")
 def healthcheck() -> Dict[str, str]:
     return {"status": "ok"}
 
@@ -262,3 +262,10 @@ async def create_upload_url(request: BlendUploadRequest) -> BlendUploadResponse:
         gcs_uri=gcs_uri,
         expires_in=int(expiration.total_seconds()),
     )
+
+
+@app.post("/upload", response_model=BlendUploadResponse, include_in_schema=False)
+async def create_upload_url_legacy(request: BlendUploadRequest) -> BlendUploadResponse:
+    """Compatibility shim for older Blender add-on versions."""
+
+    return await create_upload_url(request)
