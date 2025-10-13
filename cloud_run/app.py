@@ -12,11 +12,16 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.error import URLError
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import FastAPI, HTTPException
 from google.api_core import exceptions as gcs_exceptions
 from google.cloud import storage
 from pydantic import BaseModel, Field
+
+import google.auth
+from google.auth import exceptions as google_auth_exceptions
 
 APP_ROOT = Path(__file__).resolve().parent
 BLENDER_EXECUTABLE = os.environ.get("BLENDER_EXECUTABLE", "blender")
@@ -25,6 +30,7 @@ GCS_BUCKET = os.environ.get("RFARM_GCS_BUCKET")
 SIGNED_URL_TTL_MINUTES = int(os.environ.get("RFARM_SIGNED_URL_TTL_MINUTES", "15"))
 
 _storage_client: Optional[storage.Client] = None
+_service_account_email: Optional[str] = None
 
 app = FastAPI(title="R-Farm Render Worker", version="0.1.0")
 
@@ -89,6 +95,43 @@ def _get_storage_client() -> storage.Client:
     if _storage_client is None:
         _storage_client = storage.Client()
     return _storage_client
+
+
+def _get_service_account_email() -> Optional[str]:
+    global _service_account_email
+    if _service_account_email:
+        return _service_account_email
+
+    env_email = os.environ.get("RFARM_SERVICE_ACCOUNT_EMAIL") or os.environ.get(
+        "GOOGLE_SERVICE_ACCOUNT_EMAIL"
+    )
+    if env_email:
+        _service_account_email = env_email
+        return _service_account_email
+
+    try:
+        credentials, _ = google.auth.default()
+    except google_auth_exceptions.DefaultCredentialsError:
+        credentials = None
+
+    if credentials:
+        email = getattr(credentials, "service_account_email", None)
+        if email:
+            _service_account_email = email
+            return _service_account_email
+
+    try:
+        metadata_request = UrlRequest(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urlopen(metadata_request, timeout=2) as response:
+            email = response.read().decode("utf-8").strip()
+    except (URLError, OSError, TimeoutError):
+        email = None
+
+    _service_account_email = email
+    return _service_account_email
 
 
 def _write_blend_file(tmp_dir: Path, blend_data: str) -> Path:
@@ -246,11 +289,16 @@ async def create_upload_url(request: BlendUploadRequest) -> BlendUploadResponse:
         client = _get_storage_client()
         bucket = client.bucket(GCS_BUCKET)
         blob = bucket.blob(object_name)
+        service_account_email = _get_service_account_email()
+        signing_kwargs = {}
+        if service_account_email:
+            signing_kwargs["service_account_email"] = service_account_email
         upload_url = blob.generate_signed_url(
             version="v4",
             expiration=expiration,
             method="PUT",
             content_type="application/octet-stream",
+            **signing_kwargs,
         )
     except gcs_exceptions.GoogleAPIError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to generate upload URL: {exc}") from exc
