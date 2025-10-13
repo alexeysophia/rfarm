@@ -16,6 +16,7 @@ RUN apt-get update \
         libxrender1 \
         libgl1 \
         libglu1 \
+        libxkbcommon0 \
         python3 \
         python3-pip \
         python3-venv \
