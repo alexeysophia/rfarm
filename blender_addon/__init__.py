@@ -130,16 +130,25 @@ def _collect_render_metadata(scene) -> dict:
     return metadata
 
 
+class UploadURLNotSupported(RuntimeError):
+    """Raised when the remote worker does not expose the /upload-url endpoint."""
+
+
 def _build_payload(
     scene,
-    blend_gcs_uri: str,
+    blend_gcs_uri: Optional[str],
+    blend_inline: Optional[str],
     preferences: RFarmAddonPreferences,
 ) -> dict:
     payload = {
         "frame": scene.frame_current,
-        "blend_gcs_uri": blend_gcs_uri,
         "render_settings": _collect_render_metadata(scene),
     }
+
+    if blend_gcs_uri:
+        payload["blend_gcs_uri"] = blend_gcs_uri
+    if blend_inline:
+        payload["blend_file"] = blend_inline
 
     compute_device = "CUDA"
     cycles = scene.cycles
@@ -166,6 +175,10 @@ def _request_upload_url(
     request_payload = {"filename": blend_path.name}
 
     response = requests.post(url, headers=headers, json=request_payload, timeout=60)
+    if response.status_code == 404:
+        raise UploadURLNotSupported(
+            "Remote worker does not expose /upload-url (legacy deployment)"
+        )
     if response.status_code >= 400:
         raise RuntimeError(f"Failed to request upload URL: HTTP {response.status_code} {response.text}")
 
@@ -240,8 +253,19 @@ class RFarm_OT_render_frame(Operator):
         self.report({"INFO"}, "Submitting remote render job...")
 
         try:
-            upload_url, gcs_uri = _request_upload_url(prefs, blend_path)
-            _upload_blend_to_gcs(upload_url, blend_path)
+            gcs_uri: Optional[str] = None
+            blend_inline: Optional[str] = None
+            try:
+                upload_url, gcs_uri = _request_upload_url(prefs, blend_path)
+            except UploadURLNotSupported:
+                with open(blend_path, "rb") as handle:
+                    blend_inline = base64.b64encode(handle.read()).decode("ascii")
+                self.report(
+                    {"INFO"},
+                    "Remote worker is outdated, falling back to inline upload.",
+                )
+            else:
+                _upload_blend_to_gcs(upload_url, blend_path)
         except (requests.RequestException, RuntimeError) as exc:
             status.is_rendering = False
             status.last_error = str(exc)
@@ -249,7 +273,7 @@ class RFarm_OT_render_frame(Operator):
             shutil.rmtree(tmpdir, ignore_errors=True)
             return {"CANCELLED"}
 
-        payload = _build_payload(scene, gcs_uri, prefs)
+        payload = _build_payload(scene, gcs_uri, blend_inline, prefs)
         url = prefs.endpoint.rstrip("/") + "/render"
 
         headers = {"Content-Type": "application/json"}
