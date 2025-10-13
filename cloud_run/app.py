@@ -22,6 +22,9 @@ from pydantic import BaseModel, Field
 
 import google.auth
 from google.auth import exceptions as google_auth_exceptions
+from google.auth import impersonated_credentials
+from google.auth import credentials as google_auth_credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 APP_ROOT = Path(__file__).resolve().parent
 BLENDER_EXECUTABLE = os.environ.get("BLENDER_EXECUTABLE", "blender")
@@ -31,6 +34,7 @@ SIGNED_URL_TTL_MINUTES = int(os.environ.get("RFARM_SIGNED_URL_TTL_MINUTES", "15"
 
 _storage_client: Optional[storage.Client] = None
 _service_account_email: Optional[str] = None
+_signing_credentials: Optional[google_auth_credentials.Signing] = None
 
 app = FastAPI(title="R-Farm Render Worker", version="0.1.0")
 
@@ -132,6 +136,42 @@ def _get_service_account_email() -> Optional[str]:
 
     _service_account_email = email
     return _service_account_email
+
+
+def _get_signing_credentials(service_account_email: str) -> google_auth_credentials.Signing:
+    global _signing_credentials
+    if _signing_credentials:
+        return _signing_credentials
+
+    try:
+        base_credentials, _ = google.auth.default()
+    except google_auth_exceptions.GoogleAuthError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load Google credentials: {exc}") from exc
+
+    if hasattr(base_credentials, "with_scopes"):
+        base_credentials = base_credentials.with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
+
+    if isinstance(base_credentials, google_auth_credentials.Signing):
+        _signing_credentials = base_credentials
+        return _signing_credentials
+
+    request = GoogleAuthRequest()
+    try:
+        base_credentials.refresh(request)
+    except google_auth_exceptions.RefreshError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to refresh Google credentials: {exc}") from exc
+
+    try:
+        _signing_credentials = impersonated_credentials.Credentials(
+            source_credentials=base_credentials,
+            target_principal=service_account_email,
+            target_scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
+            lifetime=300,
+        )
+    except google_auth_exceptions.GoogleAuthError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to initialize signing credentials: {exc}") from exc
+
+    return _signing_credentials
 
 
 def _write_blend_file(tmp_dir: Path, blend_data: str) -> Path:
@@ -290,15 +330,20 @@ async def create_upload_url(request: BlendUploadRequest) -> BlendUploadResponse:
         bucket = client.bucket(GCS_BUCKET)
         blob = bucket.blob(object_name)
         service_account_email = _get_service_account_email()
-        signing_kwargs = {}
-        if service_account_email:
-            signing_kwargs["service_account_email"] = service_account_email
+        if not service_account_email:
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to determine service account email for signing upload URLs.",
+            )
+
+        signing_credentials = _get_signing_credentials(service_account_email)
         upload_url = blob.generate_signed_url(
             version="v4",
             expiration=expiration,
             method="PUT",
             content_type="application/octet-stream",
-            **signing_kwargs,
+            service_account_email=service_account_email,
+            credentials=signing_credentials,
         )
     except gcs_exceptions.GoogleAPIError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to generate upload URL: {exc}") from exc
