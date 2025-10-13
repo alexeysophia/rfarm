@@ -4,7 +4,7 @@ This repository contains a proof-of-concept implementation of a Blender add-on a
 
 ## Project structure
 
-- `blender_addon/` – Blender add-on that exposes a panel inside the **Render Properties** tab. The button submits the current frame together with the existing Cycles settings to the remote worker.
+- `blender_addon/` – Blender add-on that exposes a panel inside the **Render Properties** tab. The button submits the current frame together with the existing Cycles settings to the remote worker by first storing the `.blend` file in Google Cloud Storage.
 - `cloud_run/` – Source code and container definition for the Cloud Run GPU worker executing Blender in headless mode.
 
 ## Blender add-on
@@ -22,11 +22,13 @@ This repository contains a proof-of-concept implementation of a Blender add-on a
 4. Switch the render engine to **Cycles** and configure all render parameters as usual (resolution, samples, output path, etc.).
 5. Open the **Render Properties** tab and use the **Render Current Frame on R-Farm** button. The resulting frame is written to the configured output path.
 
-The add-on serialises the current `.blend` file to a temporary location, sends it to the worker, waits for completion, and stores the returned image on disk. Any errors from the worker are surfaced inside Blender.
+The add-on serialises the current `.blend` file to a temporary location, requests a signed upload URL from the worker, uploads the archive to Google Cloud Storage, waits for completion, and stores the returned image on disk. Any errors from the worker are surfaced inside Blender.
 
 ## Cloud Run GPU worker
 
-The worker is a FastAPI application that receives a `.blend` file (base64-encoded) together with render metadata. It starts Blender in background mode, enforces GPU rendering, and returns the rendered image as a base64 payload.
+The worker is a FastAPI application that receives a pointer to a `.blend` file stored in Google Cloud Storage together with render metadata. It starts Blender in background mode, enforces GPU rendering, and returns the rendered image as a base64 payload.
+
+Set the `RFARM_GCS_BUCKET` environment variable to the name of the Cloud Storage bucket used for temporary uploads (for example `rfarm-render-cache`). The service account running on Cloud Run must have permissions to generate signed URLs and read objects from this bucket. Optionally adjust `RFARM_SIGNED_URL_TTL_MINUTES` (default `15`) to control how long signed upload URLs remain valid.
 
 ### Building the container image
 
@@ -57,12 +59,22 @@ Cloud Run currently provisions NVIDIA L4 GPUs for managed GPU services. Adjust t
 
 ### API contract
 
+`POST /upload-url`
+
+```json
+{
+  "filename": "scene.blend"
+}
+```
+
+Returns a signed URL that the Blender add-on uses to upload the serialized `.blend` file to Cloud Storage. The response contains `upload_url`, `gcs_uri`, `blob_name`, and `expires_in`.
+
 `POST /render`
 
 ```json
 {
   "frame": 1,
-  "blend_file": "base64-encoded data",
+  "blend_gcs_uri": "gs://rfarm-render-cache/uploads/<uuid>/scene.blend",
   "render_settings": {
     "samples": 256,
     "resolution_x": 1920,
@@ -77,7 +89,7 @@ Cloud Run currently provisions NVIDIA L4 GPUs for managed GPU services. Adjust t
 }
 ```
 
-Successful responses return the rendered image encoded as base64 together with a job identifier.
+Successful responses return the rendered image encoded as base64 together with a job identifier. The `blend_file` field is still supported for compatibility, but the Blender add-on now always transfers large files via Cloud Storage.
 
 ### Running locally
 
