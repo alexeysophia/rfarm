@@ -17,6 +17,7 @@ RUN apt-get update \
         libgl1 \
         libglu1 \
         libxkbcommon0 \
+        libssl3 \
         python3 \
         python3-pip \
         python3-venv \
