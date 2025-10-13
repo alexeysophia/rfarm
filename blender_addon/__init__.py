@@ -16,7 +16,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import bpy
 from bpy.props import BoolProperty, PointerProperty, StringProperty
@@ -130,13 +130,14 @@ def _collect_render_metadata(scene) -> dict:
     return metadata
 
 
-def _build_payload(scene, blend_path: Path, preferences: RFarmAddonPreferences) -> dict:
-    with open(blend_path, "rb") as handle:
-        blend_encoded = base64.b64encode(handle.read()).decode("ascii")
-
+def _build_payload(
+    scene,
+    blend_gcs_uri: str,
+    preferences: RFarmAddonPreferences,
+) -> dict:
     payload = {
         "frame": scene.frame_current,
-        "blend_file": blend_encoded,
+        "blend_gcs_uri": blend_gcs_uri,
         "render_settings": _collect_render_metadata(scene),
     }
 
@@ -152,6 +153,41 @@ def _build_payload(scene, blend_path: Path, preferences: RFarmAddonPreferences) 
     payload["compute_device_type"] = compute_device
 
     return payload
+
+
+def _request_upload_url(
+    preferences: RFarmAddonPreferences, blend_path: Path
+) -> Tuple[str, str]:
+    url = preferences.endpoint.rstrip("/") + "/upload-url"
+    headers = {"Content-Type": "application/json"}
+    if preferences.auth_token:
+        headers["Authorization"] = f"Bearer {preferences.auth_token}"
+
+    request_payload = {"filename": blend_path.name}
+
+    response = requests.post(url, headers=headers, json=request_payload, timeout=60)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Failed to request upload URL: HTTP {response.status_code} {response.text}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Upload URL response was not valid JSON") from exc
+
+    upload_url = payload.get("upload_url")
+    gcs_uri = payload.get("gcs_uri")
+    if not upload_url or not gcs_uri:
+        raise RuntimeError("Upload URL response missing required fields")
+
+    return upload_url, gcs_uri
+
+
+def _upload_blend_to_gcs(upload_url: str, blend_path: Path) -> None:
+    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(blend_path.stat().st_size)}
+    with open(blend_path, "rb") as handle:
+        response = requests.put(upload_url, data=handle, headers=headers, timeout=300)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"Upload to Cloud Storage failed: HTTP {response.status_code} {response.text}")
 
 
 class RFarm_OT_render_frame(Operator):
@@ -198,17 +234,27 @@ class RFarm_OT_render_frame(Operator):
             self.report({"ERROR"}, f"Unable to export .blend: {ex}")
             return {"CANCELLED"}
 
-        payload = _build_payload(scene, blend_path, prefs)
+        status.is_rendering = True
+        status.last_error = ""
+        status.last_output_path = ""
+        self.report({"INFO"}, "Submitting remote render job...")
+
+        try:
+            upload_url, gcs_uri = _request_upload_url(prefs, blend_path)
+            _upload_blend_to_gcs(upload_url, blend_path)
+        except (requests.RequestException, RuntimeError) as exc:
+            status.is_rendering = False
+            status.last_error = str(exc)
+            self.report({"ERROR"}, f"Failed to upload blend file: {exc}")
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return {"CANCELLED"}
+
+        payload = _build_payload(scene, gcs_uri, prefs)
         url = prefs.endpoint.rstrip("/") + "/render"
 
         headers = {"Content-Type": "application/json"}
         if prefs.auth_token:
             headers["Authorization"] = f"Bearer {prefs.auth_token}"
-
-        status.is_rendering = True
-        status.last_error = ""
-        status.last_output_path = ""
-        self.report({"INFO"}, "Submitting remote render job...")
 
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=300)
