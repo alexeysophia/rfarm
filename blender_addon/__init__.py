@@ -120,6 +120,33 @@ class RFarmStatus(PropertyGroup):
         description="Unix timestamp for when the remote render completed",
         default=0.0,
     )
+    current_status: StringProperty(
+        name="Current Status",
+        description="Latest status message reported by the remote render job",
+        default="",
+    )
+    upload_time_seconds: FloatProperty(
+        name="Upload Duration",
+        description="Seconds spent uploading the .blend file to the service",
+        default=0.0,
+        min=0.0,
+    )
+    render_time_seconds: FloatProperty(
+        name="Render Duration",
+        description="Seconds spent rendering after submitting the request",
+        default=0.0,
+        min=0.0,
+    )
+    upload_start_timestamp: FloatProperty(
+        name="Upload Start Timestamp",
+        description="Unix timestamp when the .blend upload began",
+        default=0.0,
+    )
+    render_start_timestamp: FloatProperty(
+        name="Render Start Timestamp",
+        description="Unix timestamp when the render request was submitted",
+        default=0.0,
+    )
 
 
 class RFarm_UL_status_log(UIList):
@@ -157,13 +184,22 @@ class RFarm_PT_panel(Panel):
 
         layout.label(text="Submit the active frame to the configured R-Farm backend.")
         if status.is_rendering:
-            layout.label(text="Status: waiting for response", icon="TIME")
+            status_message = status.current_status or "Waiting for response from R-Farm"
+            layout.label(text=f"Status: {status_message}", icon="TIME")
         elif status.last_error:
             layout.label(text=f"Error: {status.last_error}", icon="ERROR")
         elif status.last_job_id:
             layout.label(text=f"Last job: {status.last_job_id}", icon="INFO")
             if status.last_output_path:
                 layout.label(text=f"Saved to: {status.last_output_path}", icon="FILE")
+            layout.label(
+                text=f"Upload time: {_format_elapsed(status.upload_time_seconds)}",
+                icon="IMPORT",
+            )
+            layout.label(
+                text=f"Render time: {_format_elapsed(status.render_time_seconds)}",
+                icon="RENDER_RESULT",
+            )
 
         layout.separator()
         row = layout.row()
@@ -318,23 +354,45 @@ def _run_remote_render_job(job_args: dict) -> None:
     def log(message: str) -> None:
         job_queue.put(("log", time.time(), message))
 
+    def update_status(message: Optional[str] = None, *, timestamp: Optional[float] = None, **extra) -> None:
+        payload = dict(extra)
+        if message is not None:
+            payload["message"] = message
+        job_queue.put(("status", timestamp or time.time(), payload))
+
     try:
+        upload_start: Optional[float] = None
+        upload_end_recorded = False
+        render_start: Optional[float] = None
+        render_end_recorded = False
+
         if requests_module is None:
             raise RuntimeError(
                 "Python module 'requests' is required. Install it in Blender's Python environment."
             )
 
         log("Requesting upload URL from R-Farm service")
+        update_status("Requesting upload URL from R-Farm service")
         gcs_uri: Optional[str] = None
         blend_inline: Optional[str] = None
 
         try:
             upload_url, gcs_uri = _request_upload_url(endpoint, auth_token, blend_path)
             log("Upload URL received, uploading .blend file")
+            upload_start = time.time()
+            update_status(
+                "Uploading .blend file to R-farm",
+                timestamp=upload_start,
+                upload_start=upload_start,
+            )
             _upload_blend_to_gcs(upload_url, blend_path)
+            upload_end = time.time()
+            update_status("Upload complete", timestamp=upload_end, upload_end=upload_end)
+            upload_end_recorded = True
             log("Blend file uploaded successfully")
         except UploadURLNotSupported:
             log("Service does not support upload URLs, embedding .blend file in request")
+            update_status("Embedding .blend file in request")
             with open(blend_path, "rb") as handle:
                 blend_inline = base64.b64encode(handle.read()).decode("ascii")
 
@@ -346,7 +404,16 @@ def _run_remote_render_job(job_args: dict) -> None:
             headers["Authorization"] = f"Bearer {auth_token}"
 
         log("Submitting render request to R-Farm service")
+        render_start = time.time()
+        update_status(
+            "Waiting for response from R-Farm",
+            timestamp=render_start,
+            render_start=render_start,
+        )
         response = requests_module.post(url, headers=headers, data=json.dumps(payload), timeout=300)
+        render_end = time.time()
+        update_status("Processing render result", timestamp=render_end, render_end=render_end)
+        render_end_recorded = True
         log(f"Service responded with HTTP {response.status_code}")
 
         if response.status_code >= 400:
@@ -382,6 +449,7 @@ def _run_remote_render_job(job_args: dict) -> None:
 
         folder_text = str(final_path.parent)
         log(f"Result saved to {folder_text} ({final_path.name})")
+        update_status("Render completed")
 
         job_queue.put(
             (
@@ -396,6 +464,14 @@ def _run_remote_render_job(job_args: dict) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log(f"Error: {exc}")
+        failure_timestamp = time.time()
+        if upload_start is not None and not upload_end_recorded:
+            update_status(timestamp=failure_timestamp, upload_end=failure_timestamp)
+            upload_end_recorded = True
+        if render_start is not None and not render_end_recorded:
+            update_status(timestamp=failure_timestamp, render_end=failure_timestamp)
+            render_end_recorded = True
+        update_status(f"Error: {exc}")
         job_queue.put(
             (
                 "result",
@@ -468,6 +544,32 @@ def _process_remote_job_queue(scene) -> bool:
 
         if kind == "log":
             _append_log_entry(status, payload, timestamp)
+            updated = True
+        elif kind == "status":
+            message = payload.get("message")
+            if message is not None:
+                status.current_status = message
+
+            upload_start = payload.get("upload_start")
+            if upload_start is not None:
+                status.upload_start_timestamp = float(upload_start)
+
+            upload_end = payload.get("upload_end")
+            if upload_end is not None and status.upload_start_timestamp:
+                status.upload_time_seconds = max(
+                    0.0, float(upload_end) - status.upload_start_timestamp
+                )
+
+            render_start = payload.get("render_start")
+            if render_start is not None:
+                status.render_start_timestamp = float(render_start)
+
+            render_end = payload.get("render_end")
+            if render_end is not None and status.render_start_timestamp:
+                status.render_time_seconds = max(
+                    0.0, float(render_end) - status.render_start_timestamp
+                )
+
             updated = True
         elif kind == "result":
             status.finish_timestamp = timestamp
@@ -572,6 +674,11 @@ class RFarm_OT_render_frame(Operator):
         status.last_job_id = ""
         status.start_timestamp = time.time()
         status.finish_timestamp = 0.0
+        status.current_status = "Preparing upload"
+        status.upload_time_seconds = 0.0
+        status.render_time_seconds = 0.0
+        status.upload_start_timestamp = 0.0
+        status.render_start_timestamp = 0.0
         status.log_entries.clear()
         status.log_index = 0
         _append_log_entry(status, "Remote render job initialised")
