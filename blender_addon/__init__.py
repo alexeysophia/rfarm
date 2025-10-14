@@ -392,6 +392,46 @@ def _run_remote_render_job(job_args: dict) -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _schedule_status_popup() -> None:
+    """Defer the popup invocation to the timer system for a valid context."""
+
+    def _invoke_popup():
+        wm = bpy.context.window_manager
+        if wm is None or not wm.windows:
+            return 0.5
+
+        for window in wm.windows:
+            screen = window.screen
+            if screen is None:
+                continue
+
+            areas = [area for area in screen.areas if area.type == "PROPERTIES"]
+            if not areas:
+                areas = list(screen.areas)
+
+            for area in areas:
+                override = bpy.context.copy()
+                override["window"] = window
+                override["screen"] = screen
+                override["area"] = area
+                for region in area.regions:
+                    if region.type == "WINDOW":
+                        override["region"] = region
+                        break
+                else:
+                    continue
+
+                try:
+                    bpy.ops.rfarm.render_status_popup(override, "INVOKE_DEFAULT")
+                except RuntimeError:
+                    pass
+                return None
+
+        return 0.5
+
+    bpy.app.timers.register(_invoke_popup, first_interval=0.0)
+
+
 def _process_remote_job_queue(scene) -> bool:
     status = scene.rfarm_status
     scene_key = scene.as_pointer()
@@ -544,11 +584,7 @@ class RFarm_OT_render_frame(Operator):
         worker.start()
 
         self.report({"INFO"}, "Remote render job submitted to R-Farm")
-        try:
-            bpy.ops.rfarm.render_status_popup("INVOKE_DEFAULT")
-        except RuntimeError:
-            # Popup may fail if invoked from non-main areas; ignore but continue.
-            pass
+        _schedule_status_popup()
 
         return {"FINISHED"}
 
