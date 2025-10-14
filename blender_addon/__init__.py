@@ -13,14 +13,26 @@ bl_info = {
 
 import base64
 import json
+import queue
 import shutil
 import tempfile
+import threading
+import time
+from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Optional, Tuple
 
 import bpy
-from bpy.props import BoolProperty, PointerProperty, StringProperty
-from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 from bpy.utils import register_class, unregister_class
 
 try:
@@ -53,6 +65,19 @@ class RFarmAddonPreferences(AddonPreferences):
         layout.prop(self, "auth_token")
 
 
+class RFarmLogEntry(PropertyGroup):
+    timestamp: FloatProperty(
+        name="Timestamp",
+        description="Unix timestamp of the log entry",
+        default=0.0,
+    )
+    message: StringProperty(
+        name="Message",
+        description="Log message emitted during the remote render",
+        default="",
+    )
+
+
 class RFarmStatus(PropertyGroup):
     last_job_id: StringProperty(
         name="Last Job ID",
@@ -75,6 +100,44 @@ class RFarmStatus(PropertyGroup):
         description="Error message returned during the previous remote render",
         default="",
     )
+    log_entries: CollectionProperty(
+        name="Log Entries",
+        type=RFarmLogEntry,
+        description="Log messages produced during the active remote render",
+    )
+    log_index: IntProperty(
+        name="Active Log Index",
+        description="Helper index used by the log UI list",
+        default=0,
+    )
+    start_timestamp: FloatProperty(
+        name="Start Timestamp",
+        description="Unix timestamp for when the current remote render began",
+        default=0.0,
+    )
+    finish_timestamp: FloatProperty(
+        name="Finish Timestamp",
+        description="Unix timestamp for when the remote render completed",
+        default=0.0,
+    )
+
+
+class RFarm_UL_status_log(UIList):
+    bl_idname = "RFarm_UL_status_log"
+
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _active_propname, _index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            timestamp = datetime.fromtimestamp(item.timestamp) if item.timestamp else None
+            if timestamp:
+                time_label = timestamp.strftime("%H:%M:%S")
+            else:
+                time_label = "--:--:--"
+            row = layout.row()
+            row.label(text=time_label, icon="TIME")
+            row.label(text=item.message)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="")
 
 
 class RFarm_PT_panel(Panel):
@@ -103,7 +166,9 @@ class RFarm_PT_panel(Panel):
                 layout.label(text=f"Saved to: {status.last_output_path}", icon="FILE")
 
         layout.separator()
-        layout.operator(RFarm_OT_render_frame.bl_idname, icon="RENDER_STILL")
+        row = layout.row()
+        row.enabled = not status.is_rendering
+        row.operator(RFarm_OT_render_frame.bl_idname, icon="RENDER_STILL")
 
 
 def _ensure_output_directory(path: Path) -> None:
@@ -130,47 +195,49 @@ def _collect_render_metadata(scene) -> dict:
     return metadata
 
 
+def _prepare_base_payload(scene) -> dict:
+    payload = {
+        "frame": scene.frame_current,
+        "render_settings": _collect_render_metadata(scene),
+    }
+
+    cycles = scene.cycles
+    payload["device"] = getattr(cycles, "device", "CPU")
+
+    compute_device = "CUDA"
+    if getattr(cycles, "device", "CPU") == "GPU":
+        prefs = bpy.context.preferences.addons.get("cycles")
+        if prefs:
+            compute_device = getattr(prefs.preferences, "compute_device_type", "CUDA")
+    payload["compute_device_type"] = compute_device
+
+    return payload
+
+
 class UploadURLNotSupported(RuntimeError):
     """Raised when the remote worker does not expose the /upload-url endpoint."""
 
 
 def _build_payload(
-    scene,
+    base_payload: dict,
     blend_gcs_uri: Optional[str],
     blend_inline: Optional[str],
-    preferences: RFarmAddonPreferences,
 ) -> dict:
-    payload = {
-        "frame": scene.frame_current,
-        "render_settings": _collect_render_metadata(scene),
-    }
+    payload = dict(base_payload)
 
     if blend_gcs_uri:
         payload["blend_gcs_uri"] = blend_gcs_uri
     if blend_inline:
         payload["blend_file"] = blend_inline
 
-    compute_device = "CUDA"
-    cycles = scene.cycles
-    if getattr(cycles, "device", "CPU") == "GPU":
-        prefs = bpy.context.preferences.addons.get("cycles")
-        if prefs:
-            compute_device = prefs.preferences.compute_device_type
-        else:
-            compute_device = "CUDA"
-    payload["device"] = cycles.device
-    payload["compute_device_type"] = compute_device
-
     return payload
 
 
-def _request_upload_url(
-    preferences: RFarmAddonPreferences, blend_path: Path
-) -> Tuple[str, str]:
-    url = preferences.endpoint.rstrip("/") + "/upload-url"
+def _request_upload_url(endpoint: str, auth_token: str, blend_path: Path) -> Tuple[str, str]:
+    url = endpoint.rstrip("/") + "/upload-url"
     headers = {"Content-Type": "application/json"}
-    if preferences.auth_token:
-        headers["Authorization"] = f"Bearer {preferences.auth_token}"
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
 
     request_payload = {"filename": blend_path.name}
 
@@ -203,6 +270,192 @@ def _upload_blend_to_gcs(upload_url: str, blend_path: Path) -> None:
         raise RuntimeError(f"Upload to Cloud Storage failed: HTTP {response.status_code} {response.text}")
 
 
+ACTIVE_RENDER_JOBS = {}
+
+
+def _format_elapsed(elapsed_seconds: float) -> str:
+    elapsed_seconds = max(0, int(elapsed_seconds))
+    hours, remainder = divmod(elapsed_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _append_log_entry(status: RFarmStatus, message: str, timestamp: Optional[float] = None) -> None:
+    entry = status.log_entries.add()
+    entry.timestamp = timestamp or time.time()
+    entry.message = message
+    status.log_index = max(0, len(status.log_entries) - 1)
+
+
+def _run_remote_render_job(job_args: dict) -> None:
+    job_queue: queue.Queue = job_args["queue"]
+    endpoint: str = job_args["endpoint"]
+    auth_token: str = job_args["auth_token"]
+    blend_path = Path(job_args["blend_path"])
+    tmpdir = Path(job_args["tmpdir"])
+    base_payload = job_args["base_payload"]
+    output_path_str: str = job_args["output_path"]
+    fallback_dir = Path(job_args["fallback_dir"])
+    requests_module = job_args["requests_module"]
+
+    def log(message: str) -> None:
+        job_queue.put(("log", time.time(), message))
+
+    try:
+        if requests_module is None:
+            raise RuntimeError(
+                "Python module 'requests' is required. Install it in Blender's Python environment."
+            )
+
+        log("Requesting upload URL from R-Farm service")
+        gcs_uri: Optional[str] = None
+        blend_inline: Optional[str] = None
+
+        try:
+            upload_url, gcs_uri = _request_upload_url(endpoint, auth_token, blend_path)
+            log("Upload URL received, uploading .blend file")
+            _upload_blend_to_gcs(upload_url, blend_path)
+            log("Blend file uploaded successfully")
+        except UploadURLNotSupported:
+            log("Service does not support upload URLs, embedding .blend file in request")
+            with open(blend_path, "rb") as handle:
+                blend_inline = base64.b64encode(handle.read()).decode("ascii")
+
+        payload = _build_payload(base_payload, gcs_uri, blend_inline)
+        url = endpoint.rstrip("/") + "/render"
+
+        headers = {"Content-Type": "application/json"}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
+        log("Submitting render request to R-Farm service")
+        response = requests_module.post(url, headers=headers, data=json.dumps(payload), timeout=300)
+        log(f"Service responded with HTTP {response.status_code}")
+
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+
+        try:
+            payload_response = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Invalid JSON response") from exc
+
+        job_id = payload_response.get("job_id", "")
+        image_base64 = payload_response.get("image_base64")
+        remote_format = payload_response.get("output_format", "PNG")
+
+        if not image_base64:
+            raise RuntimeError("Response missing image data")
+
+        image_bytes = base64.b64decode(image_base64)
+        final_path: Optional[Path] = None
+
+        if output_path_str:
+            final_path = Path(output_path_str)
+            _ensure_output_directory(final_path)
+            with open(final_path, "wb") as out_file:
+                out_file.write(image_bytes)
+        else:
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            fallback_name = f"rfarm_frame.{remote_format.lower()}"
+            final_path = fallback_dir / fallback_name
+            with open(final_path, "wb") as out_file:
+                out_file.write(image_bytes)
+
+        folder_text = str(final_path.parent)
+        log(f"Result saved to {folder_text} ({final_path.name})")
+
+        job_queue.put(
+            (
+                "result",
+                time.time(),
+                {
+                    "status": "success",
+                    "job_id": job_id,
+                    "output_path": str(final_path),
+                },
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"Error: {exc}")
+        job_queue.put(
+            (
+                "result",
+                time.time(),
+                {
+                    "status": "error",
+                    "error": str(exc),
+                },
+            )
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _process_remote_job_queue(scene) -> bool:
+    status = scene.rfarm_status
+    scene_key = scene.as_pointer()
+    job_info = ACTIVE_RENDER_JOBS.get(scene_key)
+    if not job_info:
+        return False
+
+    job_queue: queue.Queue = job_info["queue"]
+    updated = False
+
+    while True:
+        try:
+            kind, timestamp, payload = job_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if kind == "log":
+            _append_log_entry(status, payload, timestamp)
+            updated = True
+        elif kind == "result":
+            status.finish_timestamp = timestamp
+            if payload.get("status") == "success":
+                status.last_error = ""
+                status.last_job_id = payload.get("job_id", "")
+                status.last_output_path = payload.get("output_path", "")
+            else:
+                status.last_job_id = ""
+                status.last_output_path = ""
+                status.last_error = payload.get("error", "Unknown error")
+            status.is_rendering = False
+            updated = True
+            job_info["done"] = True
+
+    if job_info.get("done") and job_queue.empty():
+        ACTIVE_RENDER_JOBS.pop(scene_key, None)
+
+    return updated
+
+
+def _scene_from_pointer(pointer: int):
+    for scene in bpy.data.scenes:
+        if scene.as_pointer() == pointer:
+            return scene
+    return None
+
+
+def _remote_job_timer_callback(scene_key: int):
+    scene = _scene_from_pointer(scene_key)
+    if scene is None:
+        ACTIVE_RENDER_JOBS.pop(scene_key, None)
+        return None
+
+    _process_remote_job_queue(scene)
+    job_info = ACTIVE_RENDER_JOBS.get(scene_key)
+
+    if not job_info:
+        return None
+
+    if job_info.get("done") and job_info["queue"].empty():
+        return None
+
+    return 0.5
+
+
 class RFarm_OT_render_frame(Operator):
     bl_idname = "rfarm.render_frame"
     bl_label = "Render Current Frame on R-Farm"
@@ -220,6 +473,10 @@ class RFarm_OT_render_frame(Operator):
         scene = context.scene
         status = scene.rfarm_status
         prefs = context.preferences.addons[__name__].preferences
+
+        if status.is_rendering:
+            self.report({"WARNING"}, "A remote render is already running.")
+            return {"CANCELLED"}
 
         if requests is None:
             message = "Python module 'requests' is required. Install it in Blender's Python environment."
@@ -247,117 +504,155 @@ class RFarm_OT_render_frame(Operator):
             self.report({"ERROR"}, f"Unable to export .blend: {ex}")
             return {"CANCELLED"}
 
+        output_path = self._resolve_output_path(scene)
+        fallback_dir = Path(bpy.app.tempdir or tempfile.gettempdir())
+        base_payload = _prepare_base_payload(scene)
+
         status.is_rendering = True
         status.last_error = ""
         status.last_output_path = ""
-        self.report({"INFO"}, "Submitting remote render job...")
+        status.last_job_id = ""
+        status.start_timestamp = time.time()
+        status.finish_timestamp = 0.0
+        status.log_entries.clear()
+        status.log_index = 0
+        _append_log_entry(status, "Remote render job initialised")
 
+        job_queue: queue.Queue = queue.Queue()
+        scene_key = scene.as_pointer()
+        ACTIVE_RENDER_JOBS.pop(scene_key, None)
+        ACTIVE_RENDER_JOBS[scene_key] = {"queue": job_queue, "done": False}
+
+        job_args = {
+            "queue": job_queue,
+            "endpoint": prefs.endpoint,
+            "auth_token": prefs.auth_token,
+            "blend_path": str(blend_path),
+            "tmpdir": str(tmpdir),
+            "base_payload": base_payload,
+            "output_path": str(output_path) if output_path else "",
+            "fallback_dir": str(fallback_dir),
+            "requests_module": requests,
+        }
+
+        worker = threading.Thread(target=_run_remote_render_job, args=(job_args,), daemon=True)
+        job_info = ACTIVE_RENDER_JOBS[scene_key]
+        job_info["thread"] = worker
+        timer_callback = partial(_remote_job_timer_callback, scene_key)
+        job_info["timer_callback"] = timer_callback
+        bpy.app.timers.register(timer_callback, first_interval=0.5)
+        worker.start()
+
+        self.report({"INFO"}, "Remote render job submitted to R-Farm")
         try:
-            gcs_uri: Optional[str] = None
-            blend_inline: Optional[str] = None
-            try:
-                upload_url, gcs_uri = _request_upload_url(prefs, blend_path)
-            except UploadURLNotSupported:
-                with open(blend_path, "rb") as handle:
-                    blend_inline = base64.b64encode(handle.read()).decode("ascii")
-                self.report(
-                    {"INFO"},
-                    "Remote worker is outdated, falling back to inline upload.",
-                )
-            else:
-                _upload_blend_to_gcs(upload_url, blend_path)
-        except (requests.RequestException, RuntimeError) as exc:
-            status.is_rendering = False
-            status.last_error = str(exc)
-            self.report({"ERROR"}, f"Failed to upload blend file: {exc}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return {"CANCELLED"}
+            bpy.ops.rfarm.render_status_popup("INVOKE_DEFAULT")
+        except RuntimeError:
+            # Popup may fail if invoked from non-main areas; ignore but continue.
+            pass
 
-        payload = _build_payload(scene, gcs_uri, blend_inline, prefs)
-        url = prefs.endpoint.rstrip("/") + "/render"
-
-        headers = {"Content-Type": "application/json"}
-        if prefs.auth_token:
-            headers["Authorization"] = f"Bearer {prefs.auth_token}"
-
-        try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=300)
-        except requests.RequestException as exc:
-            status.is_rendering = False
-            status.last_error = str(exc)
-            self.report({"ERROR"}, f"Request failed: {exc}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return {"CANCELLED"}
-
-        if response.status_code >= 400:
-            status.is_rendering = False
-            status.last_error = f"HTTP {response.status_code}: {response.text}"
-            self.report({"ERROR"}, status.last_error)
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return {"CANCELLED"}
-
-        try:
-            payload_response = response.json()
-        except ValueError:
-            status.is_rendering = False
-            status.last_error = "Invalid JSON response"
-            self.report({"ERROR"}, status.last_error)
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            return {"CANCELLED"}
-
-        status.last_job_id = payload_response.get("job_id", "")
-        image_base64 = payload_response.get("image_base64")
-        remote_format = payload_response.get("output_format", "PNG")
-        output_path = self._resolve_output_path(scene)
-
-        if image_base64 and output_path:
-            _ensure_output_directory(output_path)
-            try:
-                with open(output_path, "wb") as out_file:
-                    out_file.write(base64.b64decode(image_base64))
-                status.last_output_path = str(output_path)
-                self.report({"INFO"}, f"Remote render complete: {output_path}")
-            except OSError as exc:
-                status.last_error = str(exc)
-                self.report({"ERROR"}, f"Failed to write output: {exc}")
-        elif image_base64:
-            # Fall back to a temporary directory inside Blender's session.
-            temp_dir = Path(bpy.app.tempdir or tempfile.gettempdir())
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            fallback_name = f"rfarm_frame.{remote_format.lower()}"
-            temp_path = temp_dir / fallback_name
-            try:
-                with open(temp_path, "wb") as out_file:
-                    out_file.write(base64.b64decode(image_base64))
-                status.last_output_path = str(temp_path)
-                self.report({"INFO"}, f"Saved remote render to temporary path: {temp_path}")
-            except OSError as exc:
-                status.last_error = str(exc)
-                self.report({"ERROR"}, f"Failed to write temporary output: {exc}")
-        elif not image_base64:
-            status.last_error = "Response missing image data"
-            self.report({"WARNING"}, "Remote worker did not return image bytes.")
-
-        status.is_rendering = False
-        shutil.rmtree(tmpdir, ignore_errors=True)
         return {"FINISHED"}
+
+
+class RFarm_OT_render_status_popup(Operator):
+    bl_idname = "rfarm.render_status_popup"
+    bl_label = "R-Farm Render Status"
+
+    _timer = None
+
+    def invoke(self, context, _event):
+        scene = context.scene
+        if scene is None or not hasattr(scene, "rfarm_status"):
+            return {"CANCELLED"}
+
+        wm = context.window_manager
+        wm.invoke_popup(self, width=520)
+        self._timer = wm.event_timer_add(0.5, window=context.window)
+        wm.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type == "TIMER":
+            _process_remote_job_queue(context.scene)
+            if context.area:
+                context.area.tag_redraw()
+
+            scene_key = context.scene.as_pointer()
+            status = context.scene.rfarm_status
+            job_active = scene_key in ACTIVE_RENDER_JOBS and ACTIVE_RENDER_JOBS[scene_key].get("done") is not True
+
+            if not job_active and not status.is_rendering:
+                self._remove_timer(context)
+                return {"FINISHED"}
+
+            return {"RUNNING_MODAL"}
+
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            self._remove_timer(context)
+            return {"CANCELLED"}
+
+        return {"PASS_THROUGH"}
+
+    def cancel(self, context):
+        self._remove_timer(context)
+
+    def _remove_timer(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+
+    def draw(self, context):
+        status = context.scene.rfarm_status
+        layout = self.layout
+
+        if status.start_timestamp:
+            start_dt = datetime.fromtimestamp(status.start_timestamp)
+            layout.label(text=f"Service started: {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            end_time = status.finish_timestamp if status.finish_timestamp else time.time()
+            elapsed = max(0.0, end_time - status.start_timestamp)
+        else:
+            layout.label(text="Service not started")
+            elapsed = 0.0
+
+        layout.label(text=f"Elapsed time: {_format_elapsed(elapsed)}")
+        layout.separator()
+        layout.template_list(
+            "RFarm_UL_status_log",
+            "",
+            status,
+            "log_entries",
+            status,
+            "log_index",
+            rows=8,
+        )
 
 
 classes = (
     RFarmAddonPreferences,
+    RFarmLogEntry,
     RFarmStatus,
+    RFarm_UL_status_log,
     RFarm_PT_panel,
     RFarm_OT_render_frame,
+    RFarm_OT_render_status_popup,
 )
 
 
 def register():
+    ACTIVE_RENDER_JOBS.clear()
     for cls in classes:
         register_class(cls)
     bpy.types.Scene.rfarm_status = PointerProperty(type=RFarmStatus)
 
 
 def unregister():
+    for job in list(ACTIVE_RENDER_JOBS.values()):
+        callback = job.get("timer_callback")
+        if callback:
+            try:
+                bpy.app.timers.unregister(callback)
+            except ValueError:
+                pass
+    ACTIVE_RENDER_JOBS.clear()
     for cls in reversed(classes):
         unregister_class(cls)
     if hasattr(bpy.types.Scene, "rfarm_status"):
