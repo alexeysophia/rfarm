@@ -176,6 +176,23 @@ def _ensure_output_directory(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _find_available_output_path(path: Path) -> Path:
+    """Return a path with a unique filename by appending a numeric suffix."""
+
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    counter = 1
+
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def _collect_render_metadata(scene) -> dict:
     render = scene.render
     cycles = scene.cycles
@@ -353,12 +370,13 @@ def _run_remote_render_job(job_args: dict) -> None:
         if output_path_str:
             final_path = Path(output_path_str)
             _ensure_output_directory(final_path)
+            final_path = _find_available_output_path(final_path)
             with open(final_path, "wb") as out_file:
                 out_file.write(image_bytes)
         else:
             fallback_dir.mkdir(parents=True, exist_ok=True)
             fallback_name = f"rfarm_frame.{remote_format.lower()}"
-            final_path = fallback_dir / fallback_name
+            final_path = _find_available_output_path(fallback_dir / fallback_name)
             with open(final_path, "wb") as out_file:
                 out_file.write(image_bytes)
 
